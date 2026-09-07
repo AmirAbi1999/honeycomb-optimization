@@ -1,1 +1,59 @@
-.venv
+# Byte-compiled and packaging artifacts
+__pycache__/
+*.py[cod]
+*.so
+build/
+dist/
+*.egg-info/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+.coverage
+htmlcov/
+
+# Editors, and .mcp.json because its PyCharm port is per-machine
+.idea/
+.vscode/
+*.swp
+.mcp.json
+
+# Operating system
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Optimization runs: surrogates, histories and figures are reproducible
+runs/
+outputs/
+results/
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+wandb/
+mlruns/
+
+# Solved band structures, too large and regenerable from the geometry
+data/
+*.npy
+*.npz
+*.h5
+
+# COMSOL/Matlab models and the files a solve leaves beside them
+*.mph
+*.mph.recovery/
+*.status
+*.m
+src/
+
+# Local secrets and machine-specific overrides
+.env
+*.local.json
