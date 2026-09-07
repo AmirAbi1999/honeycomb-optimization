@@ -21,25 +21,27 @@ import numpy as np
 class HoneycombGeometry:
     """One unit cell, in the parameters generate_geometry.m is handed.
 
+    Every length is in millimetres, the model unit the MATLAB solver works in.
+
     Attributes
     ----------
     hex_angle : float
         Angle between two adjacent hexagon edges, in degrees.
     hex_side_length : float
-        Hexagon side length, in metres.
+        Hexagon side length, in millimetres.
     hex_thickness : float
-        Hexagon frame thickness, in metres.
+        Hexagon frame thickness, in millimetres.
     face_sheet_thickness : float
-        Face-sheet thickness, in metres.
+        Face-sheet thickness, in millimetres.
     cell_width : float
-        Unit-cell width along the in-plane y-direction, in metres.
+        Unit-cell width along the in-plane y-direction, in millimetres.
     """
 
     hex_angle: float = 135.0
-    hex_side_length: float = 0.012
-    hex_thickness: float = 0.001
-    face_sheet_thickness: float = 0.001
-    cell_width: float = 0.001
+    hex_side_length: float = 12.0
+    hex_thickness: float = 1.0
+    face_sheet_thickness: float = 1.0
+    cell_width: float = 1.0
 
     def __post_init__(self) -> None:
         """Reject a cell generate_geometry.m would refuse to build.

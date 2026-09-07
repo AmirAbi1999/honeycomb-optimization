@@ -1,8 +1,8 @@
 """Band-gap objectives read off a solved dispersion relation.
 
-Frequencies arrive as one matrix, (n_wave_vectors, n_bands). Bands i and i + 1
+Frequencies arrive as one matrix, (n_wave_numbers, n_bands). Bands i and i + 1
 bound a pair: its edges are the highest band i and the lowest band
-i + 1 over every wave vector, and their difference and mean give the bandwidth
+i + 1 over every wave number, and their difference and mean give the bandwidth
 and mid-frequency of that pair.
 
 This module contains:
@@ -49,7 +49,7 @@ def band_gap_metrics(frequencies: np.ndarray) -> BandGapMetrics:
     Parameters
     ----------
     frequencies : numpy.ndarray
-        Eigenfrequencies with shape (n_wave_vectors, n_bands), in hertz.
+        Eigenfrequencies with shape (n_wave_numbers, n_bands), in hertz.
 
     Returns
     -------
@@ -59,7 +59,7 @@ def band_gap_metrics(frequencies: np.ndarray) -> BandGapMetrics:
     Raises
     ------
     ValueError
-        If frequencies is not a 2-D array holding at least one wave vector
+        If frequencies is not a 2-D array holding at least one wave number
         and two bands, if any entry is not finite or is negative, or if a
         band pair has both of its edges at zero.
     """
@@ -67,13 +67,13 @@ def band_gap_metrics(frequencies: np.ndarray) -> BandGapMetrics:
 
     if frequencies.ndim != 2:
         raise ValueError(
-            "frequencies must be 2-D, shaped (n_wave_vectors, n_bands); "
+            "frequencies must be 2-D, shaped (n_wave_numbers, n_bands); "
             f"received {frequencies.ndim} dimensions."
         )
 
     if frequencies.shape[0] < 1 or frequencies.shape[1] < 2:
         raise ValueError(
-            "frequencies must hold at least one wave vector and two bands to "
+            "frequencies must hold at least one wave number and two bands to "
             f"form a band pair; received shape {frequencies.shape}."
         )
 
@@ -86,11 +86,11 @@ def band_gap_metrics(frequencies: np.ndarray) -> BandGapMetrics:
             f"{frequencies.min()}."
         )
 
-    # An eigensolver returns the modes at one wave vector in whatever order it
+    # An eigensolver returns the modes at one wave number in whatever order it
     # converged them, and a band pair only means anything once they ascend
     frequencies = np.sort(frequencies, axis=1)
 
-    # A complete gap has to survive every wave vector, so each side of the
+    # A complete gap has to survive every wave number, so each side of the
     # pair is bounded by the worst one
     lower_edges = np.max(frequencies[:, :-1], axis=0)
     upper_edges = np.min(frequencies[:, 1:], axis=0)
@@ -118,7 +118,7 @@ def single_objective_targets(frequencies: np.ndarray) -> np.ndarray:
     Parameters
     ----------
     frequencies : numpy.ndarray
-        Eigenfrequencies with shape (n_wave_vectors, n_bands), in hertz.
+        Eigenfrequencies with shape (n_wave_numbers, n_bands), in hertz.
 
     Returns
     -------
@@ -139,7 +139,7 @@ def multi_objective_targets(frequencies: np.ndarray) -> np.ndarray:
     Parameters
     ----------
     frequencies : numpy.ndarray
-        Eigenfrequencies with shape (n_wave_vectors, n_bands), in hertz.
+        Eigenfrequencies with shape (n_wave_numbers, n_bands), in hertz.
 
     Returns
     -------
