@@ -39,7 +39,7 @@ class SurrogateConfig:
         the trend term rather than stretching every length-scale.
     """
 
-    smoothness: float = 2.5
+    smoothness: float = 1.5
     additive_linear: bool = False
 
     def __post_init__(self) -> None:

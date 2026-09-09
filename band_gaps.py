@@ -1,4 +1,4 @@
-"""Band-gap objectives read off a solved dispersion relation.
+"""Band-gap measurements read off a solved dispersion relation.
 
 Frequencies arrive as one matrix, (n_wave_numbers, n_bands). Bands i and i + 1
 bound a pair: its edges are the highest band i and the lowest band
@@ -8,8 +8,8 @@ and mid-frequency of that pair.
 This module contains:
     - BandGapMetrics
     - band_gap_metrics
-    - single_objective_targets
-    - multi_objective_targets
+    - relative_gap
+    - bandwidth_mid_frequency
     - maximum_relative_gap
 """
 
@@ -112,8 +112,8 @@ def band_gap_metrics(frequencies: np.ndarray) -> BandGapMetrics:
     )
 
 
-def single_objective_targets(frequencies: np.ndarray) -> np.ndarray:
-    """Evaluate the inner function h of the single-objective run.
+def relative_gap(frequencies: np.ndarray) -> np.ndarray:
+    """Measure the surrogate targets of the single-objective run.
 
     Parameters
     ----------
@@ -133,8 +133,8 @@ def single_objective_targets(frequencies: np.ndarray) -> np.ndarray:
     return band_gap_metrics(frequencies).relative_gaps
 
 
-def multi_objective_targets(frequencies: np.ndarray) -> np.ndarray:
-    """Evaluate the inner function h of the multi-objective run.
+def bandwidth_mid_frequency(frequencies: np.ndarray) -> np.ndarray:
+    """Measure the surrogate targets of the multi-objective run.
 
     Parameters
     ----------
@@ -167,8 +167,8 @@ def maximum_relative_gap(relative_gaps: np.ndarray) -> float:
     Parameters
     ----------
     relative_gaps : numpy.ndarray
-        Relative gap per band pair, measured by single_objective_targets or
-        drawn from the surrogate posterior.
+        Relative gap per band pair, measured by relative_gap or drawn
+        from the surrogate posterior.
 
     Returns
     -------
