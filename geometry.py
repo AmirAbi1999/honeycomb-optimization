@@ -2,7 +2,7 @@
 
 The two constraints are the limit checks generate_geometry.m makes before it
 builds a cell, kept signed so an unbuildable cell reports by how much it
-misses rather than only that it does.
+misses. Everything is torch.
 
 This module contains:
     - HoneycombGeometry
@@ -12,9 +12,11 @@ This module contains:
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
-import numpy as np
+import torch
+from torch import Tensor
 
 
 @dataclass(frozen=True)
@@ -65,88 +67,86 @@ class HoneycombGeometry:
             "cell_width": self.cell_width,
         }
         for name, value in lengths.items():
-            if not np.isfinite(value) or value <= 0.0:
+            if not math.isfinite(value) or value <= 0.0:
                 raise ValueError(
                     f"{name} must be finite and positive; received {value}."
                 )
 
     @property
-    def margins(self) -> np.ndarray:
+    def margins(self) -> Tensor:
         """Return this cell's two constraints, positive where it is buildable."""
-        return constraint_margins([
+        return constraint_margins(torch.tensor([
             self.hex_angle, self.hex_side_length,
             self.hex_thickness, self.face_sheet_thickness,
-        ])
+        ], dtype=torch.double))
 
     @property
     def is_buildable(self) -> bool:
         """Return whether generate_geometry.m would accept this cell."""
-        return bool(np.all(self.margins > 0.0))
+        return bool((self.margins > 0.0).all())
 
 
-def constraint_margins(parameters: np.ndarray) -> np.ndarray:
+def constraint_margins(parameters: Tensor) -> Tensor:
     """Evaluate both geometry constraints of every cell.
 
     Parameters
     ----------
-    parameters : numpy.ndarray
+    parameters : Tensor
         One cell of shape (4,), or a batch of shape (..., 4), carrying
-        hex_angle, hex_side_length, hex_thickness and face_sheet_thickness
-        in that order on the trailing axis.
+        hex_angle, hex_side_length, hex_thickness and face_sheet_thickness in
+        that order on the trailing axis.
 
     Returns
     -------
-    numpy.ndarray
-        The two constraints stacked along a trailing axis, shape (..., 2).
-        A cell is buildable where both are positive.
+    Tensor
+        The two constraints stacked along a trailing axis, shape (..., 2). A
+        cell is buildable where both are strictly positive.
 
     Raises
     ------
     ValueError
         If parameters does not carry those four on its trailing axis.
     """
-    parameters = np.asarray(parameters, dtype=np.float64)
-
     if parameters.ndim == 0 or parameters.shape[-1] != 4:
         raise ValueError(
             "parameters must carry hex_angle, hex_side_length, hex_thickness "
             "and face_sheet_thickness on the trailing axis; received shape "
-            f"{parameters.shape}."
+            f"{tuple(parameters.shape)}."
         )
 
     hex_angles = parameters[..., 0]
     side_lengths = parameters[..., 1]
-    radians = np.deg2rad(hex_angles)
+    radians = torch.deg2rad(hex_angles)
 
     # generate_geometry.m measures the frame thickness normal to the wall and
     # works in its projection onto y, which is what its default converts to
-    projected = parameters[..., 2] / np.sin(radians)
+    projected = parameters[..., 2] / torch.sin(radians)
 
     # tan(90 - angle) and tan(angle - 90) are the cotangent up to a sign, so
     # one cotangent serves both branches and zeroes itself at 90 degrees
-    cotangent = np.cos(radians) / np.sin(radians)
+    cotangent = torch.cos(radians) / torch.sin(radians)
 
     g1 = side_lengths - 2.0 * projected
-    g2 = g1 - np.where(
+    g2 = g1 - torch.where(
         hex_angles < 90.0,
         2.0 * (side_lengths - projected) * cotangent,
         -2.0 * projected * cotangent,
     )
 
-    return np.stack((g1, g2), axis=-1)
+    return torch.stack((g1, g2), -1)
 
 
-def is_feasible(parameters: np.ndarray) -> np.ndarray:
+def is_feasible(parameters: Tensor) -> Tensor:
     """Return whether each cell clears both geometry constraints.
 
     Parameters
     ----------
-    parameters : numpy.ndarray
+    parameters : Tensor
         One cell of shape (4,), or a batch of shape (..., 4).
 
     Returns
     -------
-    numpy.ndarray
+    Tensor
         Boolean of shape (...), True where the cell can be built.
 
     Raises
@@ -154,4 +154,4 @@ def is_feasible(parameters: np.ndarray) -> np.ndarray:
     ValueError
         If parameters fails any check constraint_margins makes.
     """
-    return np.all(constraint_margins(parameters) > 0.0, axis=-1)
+    return (constraint_margins(parameters) > 0.0).all(-1)
