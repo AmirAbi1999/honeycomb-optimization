@@ -136,13 +136,17 @@ def constraint_margins(parameters: Tensor) -> Tensor:
     return torch.stack((g1, g2), -1)
 
 
-def is_feasible(parameters: Tensor) -> Tensor:
-    """Return whether each cell clears both geometry constraints.
+def is_feasible(parameters: Tensor, *, clearance: float = 0.0) -> Tensor:
+    """Return whether each cell is physically valid and clears both margins.
 
     Parameters
     ----------
     parameters : Tensor
         One cell of shape (4,), or a batch of shape (..., 4).
+    clearance : float
+        Margin a cell has to clear, zero being the limit generate_geometry.m
+        itself enforces. Raise it to leave room for a solver that only reaches
+        a constraint to within its own tolerance.
 
     Returns
     -------
@@ -154,4 +158,14 @@ def is_feasible(parameters: Tensor) -> Tensor:
     ValueError
         If parameters fails any check constraint_margins makes.
     """
-    return (constraint_margins(parameters) > 0.0).all(-1)
+    # face_sheet_thickness reaches neither margin, so a cell carrying a NaN or
+    # a negative one clears both and is still nothing generate_geometry.m
+    # would accept
+    valid = (
+        parameters.isfinite().all(-1)
+        & (parameters[..., 0] > 0.0)
+        & (parameters[..., 0] < 180.0)
+        & (parameters[..., 1:] > 0.0).all(-1)
+    )
+
+    return valid & (constraint_margins(parameters) > clearance).all(-1)

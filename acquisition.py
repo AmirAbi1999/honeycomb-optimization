@@ -10,6 +10,7 @@ This module contains:
     - single_objective_acquisition
     - multi_objective_acquisition
     - propose_design
+    - propose_batch
 """
 
 from __future__ import annotations
@@ -31,7 +32,7 @@ from botorch.utils.multi_objective.box_decompositions.non_dominated import (
 from botorch.utils.sampling import draw_sobol_samples
 from torch import Tensor
 
-from geometry import constraint_margins
+from geometry import constraint_margins, is_feasible
 
 
 def single_objective_acquisition(
@@ -97,7 +98,8 @@ def multi_objective_acquisition(
     reference_point : Tensor
         Two values, as (bandwidth, negated mid-frequency), bounding the
         dominated region. Held fixed across iterations, or the hypervolumes
-        stop comparing between them.
+        stop comparing between them. Its bandwidth decides whether a closed
+        gap can reach the front, so it may not be negative.
     mc_samples : int
         Quasi-random posterior samples the expectation is taken over.
     seed : int, optional
@@ -112,7 +114,8 @@ def multi_objective_acquisition(
     ------
     ValueError
         If targets is not a finite matrix of the width the model was fitted
-        to, or if reference_point does not hold exactly two finite values.
+        to, if reference_point does not hold exactly two finite values, or if
+        its bandwidth is negative.
     """
     targets = _model_tensor(model, targets)
     _validate_targets(targets, model.num_outputs, paired=True)
@@ -122,6 +125,16 @@ def multi_objective_acquisition(
         raise ValueError(
             "reference_point must hold exactly two finite values, a bandwidth "
             f"and a negated mid-frequency; received {reference.tolist()}."
+        )
+
+    # Widths stay signed so the surrogate can see how far a pair is from
+    # opening, and a negative reference would then pay hypervolume for pairs
+    # that never open at all; zero keeps the front to real gaps
+    if reference[0] < 0.0:
+        raise ValueError(
+            "reference_point's bandwidth may not be negative, or a band pair "
+            "whose bands overlap earns hypervolume; received "
+            f"{reference[0].item()}."
         )
 
     n_pairs = targets.shape[1] // 2
@@ -157,8 +170,8 @@ def propose_design(
     bounds : Tensor
         Search bounds of shape (2, n_parameters), lower row first.
     clearance : float
-        Margin the returned cell keeps in hand. generate_geometry.m rejects a
-        cell on the limit itself, and SLSQP is free to stop exactly there.
+        Margin the restarts keep in hand and SLSQP aims at, so that its own
+        constraint tolerance still lands the answer above the limit itself.
     num_restarts, raw_samples : int
         Gradient restarts kept, and buildable candidates they are drawn from.
     max_iterations, tolerance : int, float
@@ -192,7 +205,7 @@ def propose_design(
     bounds = _model_tensor(acquisition.model, bounds)
     drawn = draw_sobol_samples(bounds=bounds, n=raw_samples, q=1, seed=seed)
     drawn = drawn.squeeze(1)
-    buildable = drawn[(constraint_margins(drawn) > clearance).all(-1)]
+    buildable = drawn[is_feasible(drawn, clearance=clearance)]
 
     if len(buildable) < num_restarts:
         raise ValueError(
@@ -206,16 +219,17 @@ def propose_design(
     with torch.no_grad():
         promise = acquisition(buildable.unsqueeze(1))
 
+    best_promise, best_start = promise.max(0)
     starts = buildable[promise.topk(num_restarts).indices]
 
-    # Both constraints are strict in generate_geometry.m and SLSQP only
-    # promises to reach zero, so each is offset by the clearance it keeps
+    # SLSQP drives an active constraint to its own zero, so each margin is
+    # offset by the clearance the answer is required to keep
     margins = [
         lambda design, index=index: constraint_margins(design)[index] - clearance
         for index in (0, 1)
     ]
 
-    candidate, _ = optimize_acqf(
+    candidate, value = optimize_acqf(
         acquisition,
         bounds=bounds,
         q=1,
@@ -226,12 +240,88 @@ def propose_design(
     )
     candidate = candidate.squeeze(0)
 
-    # SLSQP reports success on a constraint it only nearly satisfies, and a
-    # cell the solver refuses is worth less than a duller one it will build
-    if bool((constraint_margins(candidate) > clearance).all()):
+    # The clearance is what SLSQP aims at, not what its answer has to hit: it
+    # reaches a constraint only to within its own tolerance, and asking the
+    # result to clear the buffer as well would spend it twice. Acceptance is
+    # the limit itself, and a restart the solver left worse than it found it
+    # loses to the draw it started from
+    if bool(is_feasible(candidate)) and value > best_promise:
         return candidate
 
-    return starts[0]
+    return buildable[best_start]
+
+
+def propose_batch(
+    acquisition: AcquisitionFunction,
+    bounds: Tensor,
+    batch_size: int,
+    *,
+    clearance: float = 1e-6,
+    num_restarts: int = 8,
+    raw_samples: int = 256,
+    max_iterations: int = 200,
+    tolerance: float = 1e-8,
+    seed: int | None = None,
+) -> Tensor:
+    """Propose several designs, each one conditioned on those before it.
+
+    Parameters
+    ----------
+    acquisition : botorch.acquisition.AcquisitionFunction
+        Acquisition to maximize, which has to accept pending points.
+    bounds : Tensor
+        Search bounds of shape (2, n_parameters), lower row first.
+    batch_size : int
+        Designs to propose, normally one per solver worker.
+    clearance, num_restarts, raw_samples, max_iterations, tolerance : float, int
+        Passed through to propose_design for each design in turn.
+    seed : int, optional
+        Fixes the Sobol draws, offset by each design's position so they do
+        not all start from the same restarts.
+
+    Returns
+    -------
+    Tensor
+        Designs of shape (batch_size, n_parameters), buildable by
+        construction.
+
+    Raises
+    ------
+    ValueError
+        If batch_size is not positive, or if propose_design rejects the
+        acquisition once it carries pending points.
+    """
+    if batch_size < 1:
+        raise ValueError(f"batch_size must be positive; received {batch_size}.")
+
+    pending = acquisition.X_pending
+    proposals: list[Tensor] = []
+
+    # Greedy rather than a joint q-batch: qLogEI integrates over the posterior
+    # at the pending points, so each design is chosen knowing the others are
+    # already on their way to a solver, and the restarts stay a q = 1 problem
+    # that the geometry constraints can still be handed to
+    try:
+        for position in range(batch_size):
+            if proposals:
+                acquisition.set_X_pending(torch.stack(proposals))
+
+            proposals.append(propose_design(
+                acquisition,
+                bounds,
+                clearance=clearance,
+                num_restarts=num_restarts,
+                raw_samples=raw_samples,
+                max_iterations=max_iterations,
+                tolerance=tolerance,
+                seed=None if seed is None else seed + position,
+            ))
+    finally:
+        # The caller's acquisition is left as it was handed over, pending
+        # points included, however the loop ended
+        acquisition.set_X_pending(pending)
+
+    return torch.stack(proposals)
 
 
 class _BandPairObjective(MCMultiOutputObjective):
