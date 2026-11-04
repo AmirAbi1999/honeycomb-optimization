@@ -1,9 +1,7 @@
-"""One long-lived MATLAB engine driving the SEM dispersion solver.
+"""Long-lived MATLAB engines, alone or pooled, calling into one source folder.
 
-evaluate_dispersion.m takes its geometry as [hex_angle, cell_width,
-face_sheet_thickness, hex_thickness, hex_side_length, hex_side_length], the
-same degrees and millimetres a HoneycombGeometry already holds, so the
-reordering lives here rather than at each call site.
+A caller names a source folder and the functions it needs, and gets numpy
+arrays back.
 
 This module contains:
     - MatlabCaller
@@ -15,34 +13,25 @@ from __future__ import annotations
 import logging
 import queue
 import time
+from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 from pathlib import Path
 
 import numpy as np
 
-from geometry import HoneycombGeometry
-
 log = logging.getLogger(__name__)
-
-# Every function evaluate_dispersion.m reaches for that lives beside it
-REQUIRED_FUNCTIONS = (
-    "evaluate_dispersion",
-    "generate_geometry",
-    "geometry_parameters",
-    "get_material_property",
-    "element_sampling_3D",
-    "element_prepare_3D",
-    "Mass_and_Stiffness_Element_3D",
-)
 
 
 class MatlabCaller:
-    """Start MATLAB once and reuse it for every geometry evaluation.
+    """Start MATLAB once, put a source folder on its path, and call into it.
 
     Parameters
     ----------
     source_folder : str or pathlib.Path
-        Directory holding evaluate_dispersion.m and the functions it calls.
+        Directory holding the MATLAB functions to call.
+    required_functions : sequence of str
+        Functions check confirms are on the path.
 
     Raises
     ------
@@ -52,26 +41,29 @@ class MatlabCaller:
         If the MATLAB engine package is not installed.
     """
 
-    def __init__(self, source_folder: str | Path) -> None:
+    def __init__(
+        self,
+        source_folder: str | Path,
+        required_functions: Sequence[str] = (),
+    ) -> None:
         folder = Path(source_folder).resolve()
         if not folder.is_dir():
             raise FileNotFoundError(f"MATLAB source folder not found: {folder}")
 
-        # Imported here, not at module scope, so the rest of the project stays
+        # Imported here, not at module scope, so the rest of a project stays
         # importable on a machine the engine cannot be installed on
         try:
             import matlab
             import matlab.engine
         except ImportError as error:
             raise ImportError(
-                "The matlabengine package is required to solve dispersion; it "
+                "The matlabengine package is required to call MATLAB; it "
                 "installs against a MATLAB release and Python 3.13 or older."
             ) from error
 
         self.matlab = matlab
+        self.required_functions = tuple(required_functions)
 
-        # Starting the engine costs tens of seconds, long enough that a silent
-        # wait reads as a hang
         log.info("Starting the MATLAB engine, which takes a moment")
         started = time.perf_counter()
         self.engine = matlab.engine.start_matlab()
@@ -88,125 +80,66 @@ class MatlabCaller:
             self.close()
             raise
 
-        log.info("Added the solver sources to the MATLAB path: %s", folder)
+        log.info("Added the source folder to the MATLAB path: %s", folder)
 
     def check(self) -> None:
-        """Confirm the engine can see every function a solve needs.
+        """Confirm the engine can see every required function.
 
         Raises
         ------
         RuntimeError
-            If any required function is not on the engine's path, which
-            addpath reports no error for.
+            If a required function is not on the engine's path, which addpath
+            reports no error for.
         """
         missing = [
-            name for name in REQUIRED_FUNCTIONS
+            name for name in self.required_functions
             if int(self.engine.exist(name, "file")) != 2
         ]
         if missing:
             raise RuntimeError(
-                "The MATLAB path is missing "
-                f"{', '.join(missing)}; check the source folder."
+                f"The MATLAB path is missing {', '.join(missing)}; check the "
+                "source folder."
             )
 
-        log.info("All %d solver functions are on the MATLAB path", len(
-            REQUIRED_FUNCTIONS
-        ))
+        log.info(
+            "All %d required functions are on the MATLAB path",
+            len(self.required_functions),
+        )
 
-    def evaluate(
+    def call(
         self,
-        geometry: HoneycombGeometry,
-        *,
-        delta: float,
-        minimum_polynomial_order: int,
-        n_wave_numbers: int,
-        n_bands: int,
-    ) -> np.ndarray:
-        """Solve one cell's dispersion relation.
+        function_name: str,
+        *arguments: object,
+        nargout: int = 1,
+    ) -> tuple[np.ndarray, ...]:
+        """Call one MATLAB function and return its outputs as numpy arrays.
 
         Parameters
         ----------
-        geometry : HoneycombGeometry
-            Cell to solve, in millimetres and degrees.
-        delta : float
-            Positive resolution factor of the spectral element mesh.
-        minimum_polynomial_order : int
-            Element order floor, at least 3 and within the solver's maximum.
-        n_wave_numbers : int
-            Wave numbers swept, at least 2.
-        n_bands : int
-            Bands returned at each wave number, MATLAB's n_frequencies.
+        function_name : str
+            Function on the engine's path.
+        *arguments : object
+            Strings, passed as they are, or real numbers, arrays and nested
+            lists, sent as doubles.
+        nargout : int
+            Outputs to ask MATLAB for.
 
         Returns
         -------
-        numpy.ndarray
-            Frequencies in hertz with shape (n_wave_numbers, n_bands).
-
-        Raises
-        ------
-        ValueError
-            If MATLAB returns a matrix of some other shape, a complex matrix,
-            or one carrying a non-finite or negative frequency.
+        tuple of numpy.ndarray
+            One array per output, nargout of them.
         """
-        # hex_side_length fills the solver's last two slots, which this
-        # project keeps equal
-        geometry_values = [
-            geometry.hex_angle,
-            geometry.cell_width,
-            geometry.face_sheet_thickness,
-            geometry.hex_thickness,
-            geometry.hex_side_length,
-            geometry.hex_side_length,
-        ]
-
-        log.debug("Solving %s", geometry_values)
-        started = time.perf_counter()
-
-        frequencies = self.engine.evaluate_dispersion(
-            self.matlab.double([geometry_values]),
-            float(delta),
-            float(minimum_polynomial_order),
-            float(n_wave_numbers),
-            float(n_bands),
-            nargout=1,
+        outputs = getattr(self.engine, function_name)(
+            *(self._to_matlab(argument) for argument in arguments),
+            nargout=nargout,
         )
-        frequencies = np.asarray(frequencies)
 
-        log.debug("Solved in %.1f s", time.perf_counter() - started)
+        # MATLAB hands back None for no output and a bare value for one, so
+        # every count comes back as one tuple and callers never branch on it
+        if nargout < 2:
+            outputs = () if nargout == 0 else (outputs,)
 
-        # A damped or unstable mode comes back complex, and casting to float
-        # would drop the imaginary part behind a ComplexWarning
-        if np.iscomplexobj(frequencies):
-            raise ValueError(
-                "evaluate_dispersion returned complex frequencies, which mark "
-                "damped or unstable modes rather than a real band structure."
-            )
-
-        frequencies = frequencies.astype(np.float64)
-
-        expected_shape = (n_wave_numbers, n_bands)
-        if frequencies.shape != expected_shape:
-            raise ValueError(
-                f"evaluate_dispersion returned {frequencies.shape}; expected "
-                f"{expected_shape}."
-            )
-
-        # A failed eigensolve returns NaN rather than raising, and blaming the
-        # band structure downstream would point at the wrong step
-        n_broken = int(np.sum(~np.isfinite(frequencies)))
-        if n_broken:
-            raise ValueError(
-                f"evaluate_dispersion returned {n_broken} non-finite "
-                "frequencies; the eigensolve did not converge."
-            )
-
-        if np.any(frequencies < 0):
-            raise ValueError(
-                "evaluate_dispersion returned a negative frequency, the "
-                f"lowest being {frequencies.min()}."
-            )
-
-        return frequencies
+        return tuple(np.asarray(output) for output in outputs)
 
     def close(self) -> None:
         """Shut the engine down, and stay quiet if it is already down."""
@@ -223,20 +156,35 @@ class MatlabCaller:
         """Shut the engine down however the block ended."""
         self.close()
 
+    def _to_matlab(self, value: object) -> object:
+        """Send a string as it is, a number as a double, an array as a matrix."""
+        if isinstance(value, str):
+            return value
+
+        # MATLAB reads a Python int as int64, which most numerical code cannot
+        # mix with doubles, so integers go as doubles too
+        array = np.asarray(value, dtype=np.float64)
+        if array.ndim == 0:
+            return float(array)
+
+        return self.matlab.double(array.tolist())
+
 
 class MatlabPool:
-    """One engine per worker, checked out for the length of a single solve.
+    """One engine per worker, lent to a single call at a time.
 
-    Answers evaluate with the same signature MatlabCaller does, so a caller
-    that solves one design at a time cannot tell the two apart. An engine
-    serves one call at a time, so concurrency comes from holding several.
+    Answers check and call as a MatlabCaller does, so code that makes one call
+    at a time cannot tell the two apart. An engine serves one call at a time,
+    so concurrency comes from holding several.
 
     Parameters
     ----------
     source_folder : str or pathlib.Path
-        Directory holding evaluate_dispersion.m and the functions it calls.
+        Directory holding the MATLAB functions to call.
     n_workers : int
-        Engines to start, and so solves that can be in flight at once.
+        Engines to start, and so calls that can be in flight at once.
+    required_functions : sequence of str
+        Functions check confirms are on every engine's path.
 
     Raises
     ------
@@ -244,7 +192,12 @@ class MatlabPool:
         If n_workers is not positive.
     """
 
-    def __init__(self, source_folder: str | Path, n_workers: int) -> None:
+    def __init__(
+        self,
+        source_folder: str | Path,
+        n_workers: int,
+        required_functions: Sequence[str] = (),
+    ) -> None:
         if n_workers < 1:
             raise ValueError(f"n_workers must be positive; received {n_workers}.")
 
@@ -253,17 +206,14 @@ class MatlabPool:
 
         # Startup blocks in the engine's C extension rather than on the GIL,
         # so N engines cost about as long as one rather than N times as long
+        start = partial(MatlabCaller, source_folder, required_functions)
         with ThreadPoolExecutor(max_workers=n_workers) as pool:
-            futures = [
-                pool.submit(MatlabCaller, source_folder) for _ in range(n_workers)
-            ]
-            self.callers: list[MatlabCaller] = []
+            futures = [pool.submit(start) for _ in range(n_workers)]
             try:
-                for future in futures:
-                    self.callers.append(future.result())
+                self.callers = [future.result() for future in futures]
             except Exception:
-                # Whatever started has to be shut down, or the failed run
-                # leaves orphaned MATLAB processes behind
+                # Whatever started has to be shut down, or the failure leaves
+                # orphaned MATLAB processes behind
                 for future in futures:
                     if not future.cancelled() and future.exception() is None:
                         future.result().close()
@@ -279,7 +229,7 @@ class MatlabPool:
             self._free.put(caller)
 
     def check(self) -> None:
-        """Confirm every engine can see the functions a solve needs.
+        """Confirm every engine can see every required function.
 
         Raises
         ------
@@ -289,22 +239,27 @@ class MatlabPool:
         for caller in self.callers:
             caller.check()
 
-    def evaluate(self, *arguments: object, **keywords: object) -> np.ndarray:
-        """Solve one cell on whichever engine is free, waiting for one.
+    def call(
+        self,
+        function_name: str,
+        *arguments: object,
+        nargout: int = 1,
+    ) -> tuple[np.ndarray, ...]:
+        """Call one MATLAB function on whichever engine is free, waiting for one.
 
         Parameters
         ----------
-        *arguments, **keywords
-            Passed through to MatlabCaller.evaluate unchanged.
+        function_name, *arguments, nargout
+            As MatlabCaller.call takes them.
 
         Returns
         -------
-        numpy.ndarray
-            Frequencies in hertz, as MatlabCaller.evaluate returns them.
+        tuple of numpy.ndarray
+            One array per output, as MatlabCaller.call returns them.
         """
         caller = self._free.get()
         try:
-            return caller.evaluate(*arguments, **keywords)
+            return caller.call(function_name, *arguments, nargout=nargout)
         finally:
             self._free.put(caller)
 
