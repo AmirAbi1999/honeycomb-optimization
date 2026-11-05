@@ -1,8 +1,9 @@
 """Geometry feasibility for the honeycomb unit cell.
 
-The two constraints are the limit checks generate_geometry.m makes before it
-builds a cell, kept signed so an unbuildable cell reports by how much it
-misses. Everything is torch.
+A cell carries all five HoneycombGeometry fields, in field order. The two
+constraints are the limit checks generate_geometry.m makes before it builds a
+cell, kept signed so an unbuildable cell reports by how much it misses.
+Everything is torch.
 
 This module contains:
     - HoneycombGeometry
@@ -12,8 +13,7 @@ This module contains:
 
 from __future__ import annotations
 
-import math
-from dataclasses import dataclass
+from dataclasses import astuple, dataclass
 
 import torch
 from torch import Tensor
@@ -39,11 +39,11 @@ class HoneycombGeometry:
         Unit-cell width along the in-plane y-direction, in millimetres.
     """
 
-    hex_angle: float = 135.0
-    hex_side_length: float = 12.0
-    hex_thickness: float = 1.0
-    face_sheet_thickness: float = 1.0
-    cell_width: float = 1.0
+    hex_angle: float
+    hex_side_length: float
+    hex_thickness: float
+    face_sheet_thickness: float
+    cell_width: float
 
     def __post_init__(self) -> None:
         """Reject a cell generate_geometry.m would refuse to build.
@@ -51,98 +51,71 @@ class HoneycombGeometry:
         Raises
         ------
         ValueError
-            If hex_angle is not strictly between 0 and 180 degrees, or if any
-            length is not finite and positive.
+            If the cell is not feasible.
         """
-        if not 0.0 < self.hex_angle < 180.0:
+        cell = torch.tensor(astuple(self), dtype=torch.double)
+
+        if not bool(is_feasible(cell)):
             raise ValueError(
-                "hex_angle must lie strictly between 0 and 180 degrees; "
-                f"received {self.hex_angle}."
+                f"{self} is not a cell generate_geometry.m can build; its "
+                f"margins are {constraint_margins(cell).tolist()}."
             )
 
-        lengths = {
-            "hex_side_length": self.hex_side_length,
-            "hex_thickness": self.hex_thickness,
-            "face_sheet_thickness": self.face_sheet_thickness,
-            "cell_width": self.cell_width,
-        }
-        for name, value in lengths.items():
-            if not math.isfinite(value) or value <= 0.0:
-                raise ValueError(
-                    f"{name} must be finite and positive; received {value}."
-                )
 
-    @property
-    def margins(self) -> Tensor:
-        """Return this cell's two constraints, positive where it is buildable."""
-        return constraint_margins(torch.tensor([
-            self.hex_angle, self.hex_side_length,
-            self.hex_thickness, self.face_sheet_thickness,
-        ], dtype=torch.double))
-
-    @property
-    def is_buildable(self) -> bool:
-        """Return whether generate_geometry.m would accept this cell."""
-        return bool((self.margins > 0.0).all())
-
-
-def constraint_margins(parameters: Tensor) -> Tensor:
+def constraint_margins(cells: Tensor) -> Tensor:
     """Evaluate both geometry constraints of every cell.
 
     Parameters
     ----------
-    parameters : Tensor
-        One cell of shape (4,), or a batch of shape (..., 4), carrying
-        hex_angle, hex_side_length, hex_thickness and face_sheet_thickness in
-        that order on the trailing axis.
+    cells : Tensor
+        One cell of shape (5,), or a batch of shape (..., 5), carrying the
+        HoneycombGeometry fields in field order on the trailing axis.
 
     Returns
     -------
     Tensor
-        The two constraints stacked along a trailing axis, shape (..., 2). A
-        cell is buildable where both are strictly positive.
+        The available gap and what is left of it once the walls move, stacked
+        along a trailing axis, shape (..., 2). A cell is buildable where both
+        are strictly positive.
 
     Raises
     ------
     ValueError
-        If parameters does not carry those four on its trailing axis.
+        If cells does not carry five values on its trailing axis.
     """
-    if parameters.ndim == 0 or parameters.shape[-1] != 4:
+    if cells.ndim == 0 or cells.shape[-1] != 5:
         raise ValueError(
-            "parameters must carry hex_angle, hex_side_length, hex_thickness "
-            "and face_sheet_thickness on the trailing axis; received shape "
-            f"{tuple(parameters.shape)}."
+            "cells must carry the five HoneycombGeometry fields on the trailing "
+            f"axis; received shape {tuple(cells.shape)}."
         )
 
-    hex_angles = parameters[..., 0]
-    side_lengths = parameters[..., 1]
-    radians = torch.deg2rad(hex_angles)
+    hex_angles = cells[..., 0]
+    side_lengths = cells[..., 1]
 
     # generate_geometry.m measures the frame thickness normal to the wall and
     # works in its projection onto y, which is what its default converts to
-    projected = parameters[..., 2] / torch.sin(radians)
+    projected_thickness = cells[..., 2] / torch.sin(torch.deg2rad(hex_angles))
+    available_gap = side_lengths - 2.0 * projected_thickness
 
-    # tan(90 - angle) and tan(angle - 90) are the cotangent up to a sign, so
-    # one cotangent serves both branches and zeroes itself at 90 degrees
-    cotangent = torch.cos(radians) / torch.sin(radians)
-
-    g1 = side_lengths - 2.0 * projected
-    g2 = g1 - torch.where(
+    # tan(90 - angle) below 90 degrees is -tan(angle - 90), so one slant serves
+    # both of the movement checks generate_geometry.m makes
+    slants = torch.tan(torch.deg2rad(hex_angles - 90.0))
+    total_movement = torch.where(
         hex_angles < 90.0,
-        2.0 * (side_lengths - projected) * cotangent,
-        -2.0 * projected * cotangent,
+        -2.0 * (side_lengths - projected_thickness) * slants,
+        2.0 * projected_thickness * slants,
     )
 
-    return torch.stack((g1, g2), -1)
+    return torch.stack((available_gap, available_gap - total_movement), -1)
 
 
-def is_feasible(parameters: Tensor, *, clearance: float = 0.0) -> Tensor:
+def is_feasible(cells: Tensor, *, clearance: float = 0.0) -> Tensor:
     """Return whether each cell is physically valid and clears both margins.
 
     Parameters
     ----------
-    parameters : Tensor
-        One cell of shape (4,), or a batch of shape (..., 4).
+    cells : Tensor
+        One cell of shape (5,), or a batch of shape (..., 5).
     clearance : float
         Margin a cell has to clear, zero being the limit generate_geometry.m
         itself enforces. Raise it to leave room for a solver that only reaches
@@ -156,16 +129,17 @@ def is_feasible(parameters: Tensor, *, clearance: float = 0.0) -> Tensor:
     Raises
     ------
     ValueError
-        If parameters fails any check constraint_margins makes.
+        If cells fails any check constraint_margins makes.
     """
-    # face_sheet_thickness reaches neither margin, so a cell carrying a NaN or
-    # a negative one clears both and is still nothing generate_geometry.m
-    # would accept
+    # face_sheet_thickness and cell_width reach neither margin, so a NaN,
+    # infinite or negative one clears both and is still nothing
+    # generate_geometry.m would accept; a NaN or infinite angle already fails
+    # its own two comparisons
+    lengths = cells[..., 1:]
     valid = (
-        parameters.isfinite().all(-1)
-        & (parameters[..., 0] > 0.0)
-        & (parameters[..., 0] < 180.0)
-        & (parameters[..., 1:] > 0.0).all(-1)
+        (cells[..., 0] > 0.0)
+        & (cells[..., 0] < 180.0)
+        & (lengths.isfinite() & (lengths > 0.0)).all(-1)
     )
 
-    return valid & (constraint_margins(parameters) > clearance).all(-1)
+    return valid & (constraint_margins(cells) > clearance).all(-1)
