@@ -11,6 +11,7 @@ This module contains:
     - relative_gap
     - bandwidth_mid_frequency
     - maximum_relative_gap
+    - pareto_hypervolume
 """
 
 from __future__ import annotations
@@ -194,7 +195,7 @@ def maximum_relative_gap(relative_gaps: np.ndarray) -> float:
     Parameters
     ----------
     relative_gaps : numpy.ndarray
-Relative gap per band a pair of one design, as relative_gap measures it.
+        Relative gap per band a pair of one design, as relative_gap measures it.
 
     Returns
     -------
@@ -218,3 +219,86 @@ Relative gap per band a pair of one design, as relative_gap measures it.
         )
 
     return float(np.max(relative_gaps))
+
+
+def pareto_hypervolume(
+    targets: np.ndarray,
+    reference_point: np.ndarray,
+    *,
+    asinh_scale: float | None = None,
+) -> float:
+    """Apply the multi-objective outer function g to every cell observed so far.
+
+    Parameters
+    ----------
+    targets : numpy.ndarray
+        Interleaved bandwidths and mid-frequencies of shape
+        (n_designs, 2 * n_pairs), one row per design as
+        bandwidth_mid_frequency measures it. Every band pair is one point.
+    reference_point : numpy.ndarray
+        Two values, as (bandwidth, negated mid-frequency) in hertz, bounding
+        the dominated region, as the multi-objective acquisition is handed.
+    asinh_scale : float, optional
+        Hertz at which both axes turn from linear to logarithmic, through
+        asinh(value / asinh_scale), so every decade of bandwidth and of
+        mid-frequency weighs alike. None measures the area in square hertz.
+
+    Returns
+    -------
+    float
+        Area the band pairs dominate in (bandwidth, negated mid-frequency),
+        in square hertz or in the asinh units asinh_scale sets.
+
+    Raises
+    ------
+    ValueError
+        If targets is not a finite matrix whose columns pair up, if
+        reference_point does not hold exactly two finite values, or if
+        asinh_scale is not finite and positive.
+    """
+    targets = np.asarray(targets, dtype=np.float64)
+    reference = np.asarray(reference_point, dtype=np.float64)
+
+    if asinh_scale is not None and not 0.0 < asinh_scale < np.inf:
+        raise ValueError(
+            f"asinh_scale must be finite and positive; received {asinh_scale}."
+        )
+
+    if (
+        targets.ndim != 2
+        or targets.shape[0] < 1
+        or targets.shape[1] < 2
+        or targets.shape[1] % 2 != 0
+        or not np.all(np.isfinite(targets))
+    ):
+        raise ValueError(
+            "targets must be a finite matrix of one row per design, "
+            "interleaving one bandwidth and one mid-frequency per band pair; "
+            f"received shape {targets.shape}."
+        )
+
+    if reference.shape != (2,) or not np.all(np.isfinite(reference)):
+        raise ValueError(
+            "reference_point must hold exactly two finite values, a bandwidth "
+            f"and a negated mid-frequency; received {reference.tolist()}."
+        )
+
+    points = targets.reshape(-1, 2) * [1.0, -1.0]
+
+    # asinh is odd and increasing, so it keeps every dominance and the sign of
+    # the negated mid-frequency, and changes only how much each region weighs
+    if asinh_scale is not None:
+        points = np.arcsinh(points / asinh_scale)
+        reference = np.arcsinh(reference / asinh_scale)
+
+    # A point short of the reference on either side dominates nothing, and
+    # clamping it there zeroes its share without a separate filter
+    points = np.maximum(points, reference)
+
+    # Widest first, so each point adds only the height it reaches above every
+    # wider point before it, and the dominated staircase is measured exactly
+    ordered = points[np.argsort(-points[:, 0], kind="stable")]
+    heights = np.maximum.accumulate(ordered[:, 1])
+    steps = np.diff(heights, prepend=reference[1])
+
+    return float(np.sum((ordered[:, 0] - reference[0]) * steps))
