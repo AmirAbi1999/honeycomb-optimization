@@ -3,7 +3,7 @@
 One independent ARD Matern GP per target column, carried by a single batched
 SingleTaskGP. Designs arrive in their own units and are normalized against
 fixed bounds inside the model, which holds the scaling steady across BO
-iterations.
+iterations. The solver is deterministic, so every GP interpolates its data.
 
 This module contains:
     - SurrogateConfig
@@ -20,7 +20,7 @@ from botorch.fit import fit_gpytorch_mll
 from botorch.models import SingleTaskGP
 from botorch.models.transforms.input import Normalize
 from botorch.models.transforms.outcome import Standardize
-from gpytorch.kernels import Kernel, LinearKernel, MaternKernel, ScaleKernel
+from gpytorch.kernels import MaternKernel, ScaleKernel
 from gpytorch.mlls import ExactMarginalLogLikelihood
 from gpytorch.priors import GammaPrior
 from torch import Tensor
@@ -34,26 +34,32 @@ class SurrogateConfig:
     ----------
     smoothness : {0.5, 1.5, 2.5}
         Matern nu, lower for targets that kink where two modes cross.
-    additive_linear : bool
-        Sum a linear kernel beside the Matern, so a monotone trend rides in
-        the trend term rather than stretching every length-scale.
+    jitter : float
+        Observation noise held fixed, as a fraction of each column's variance.
+        A numerical floor for the Cholesky factor, not a noise model.
     """
 
     smoothness: float = 1.5
-    additive_linear: bool = False
+    jitter: float = 1e-6
 
     def __post_init__(self) -> None:
-        """Reject a Matern order GPyTorch does not implement.
+        """Reject a Matern order GPyTorch does not implement, or a bad jitter.
 
         Raises
         ------
         ValueError
-            If smoothness is not one of 0.5, 1.5 or 2.5.
+            If smoothness is not one of 0.5, 1.5 or 2.5, or if jitter is not
+            finite and positive.
         """
         if self.smoothness not in (0.5, 1.5, 2.5):
             raise ValueError(
                 "smoothness must be one of 0.5, 1.5 or 2.5; received "
                 f"{self.smoothness}."
+            )
+
+        if not 0.0 < self.jitter < float("inf"):
+            raise ValueError(
+                f"jitter must be finite and positive; received {self.jitter}."
             )
 
 
@@ -101,9 +107,18 @@ def build_surrogates(
     # batched anyway would hand the posterior a spurious leading axis
     batch_shape = torch.Size([n_targets] if n_targets > 1 else [])
 
+    # FEM band gaps carry no noise, and an inferred noise level lets a GP
+    # explain a kink where two modes cross as an outlier it can ignore.
+    # Standardize divides the variance by the column's own, so the jitter is
+    # scaled up front to land at config.jitter after it; a constant column is
+    # left unscaled, as Standardize leaves it
+    spread = targets.var(dim=0, keepdim=True)
+    spread = spread.where(spread.sqrt() >= 1e-8, torch.ones_like(spread))
+
     return SingleTaskGP(
         designs,
         targets,
+        train_Yvar=(config.jitter * spread).expand_as(targets),
         covar_module=_covariance_module(n_parameters, batch_shape, config),
         outcome_transform=Standardize(m=n_targets),
         # Fixed bounds, not the data range: a transform refitted each round
@@ -140,7 +155,7 @@ def _covariance_module(
     n_parameters: int,
     batch_shape: torch.Size,
     config: SurrogateConfig,
-) -> Kernel:
+) -> ScaleKernel:
     """Build the kernel one target column is modelled with.
 
     Parameters
@@ -150,16 +165,16 @@ def _covariance_module(
     batch_shape : torch.Size
         Columns to hold independent hyperparameters for, empty for one column.
     config : SurrogateConfig
-        Matern order, and whether a linear term rides beside it.
+        Matern order the kernel is built with.
 
     Returns
     -------
-    gpytorch.kernels.Kernel
-        Scaled ARD Matern kernel, optionally summed with a linear one.
+    gpytorch.kernels.ScaleKernel
+        Scaled ARD Matern kernel.
     """
     # The Gamma priors are what keep a fit on ten or twenty designs from
     # running the length-scales off to a degenerate optimum
-    matern = ScaleKernel(
+    return ScaleKernel(
         MaternKernel(
             nu=config.smoothness,
             ard_num_dims=n_parameters,
@@ -169,21 +184,6 @@ def _covariance_module(
         batch_shape=batch_shape,
         outputscale_prior=GammaPrior(2.0, 0.15),
     )
-
-    if not config.additive_linear:
-        return matern
-
-    # A monotone trend costs the Matern one very long length-scale to express,
-    # and that same length-scale then blunts it everywhere else
-    linear = LinearKernel(
-        ard_num_dims=n_parameters,
-        batch_shape=batch_shape,
-        variance_prior=GammaPrior(2.0, 0.15),
-    )
-
-    # Linear first: a low-rank right operand sends the sum through
-    # LinearOperator.add_low_rank, whose eigh diverges on an ill-conditioned fit
-    return linear + matern
 
 
 def _validate_training_data(
@@ -210,15 +210,16 @@ def _validate_training_data(
             f"least two designs; received shape {tuple(designs.shape)}."
         )
 
-    if targets.ndim != 2 or targets.shape[0] != designs.shape[0]:
+    if (
+        targets.ndim != 2
+        or targets.shape[0] != designs.shape[0]
+        or targets.shape[1] < 1
+    ):
         raise ValueError(
             "targets must be a (n_designs, n_targets) matrix with one row per "
-            f"design; received {tuple(targets.shape)} for {designs.shape[0]} "
-            "designs."
+            f"design and at least one column; received {tuple(targets.shape)} "
+            f"for {designs.shape[0]} designs."
         )
-
-    if targets.shape[1] == 0:
-        raise ValueError("targets must carry at least one output column.")
 
     if tuple(bounds.shape) != (2, designs.shape[1]):
         raise ValueError(
@@ -234,7 +235,8 @@ def _validate_training_data(
 
     if (bounds[0] >= bounds[1]).any():
         raise ValueError(
-            f"every lower bound must sit below its upper; received {bounds}."
+            "Every lower bound must sit below its upper; received "
+            f"{bounds.tolist()}."
         )
 
     outside = ((designs < bounds[0]) | (designs > bounds[1])).any(dim=1)
